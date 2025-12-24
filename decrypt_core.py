@@ -306,15 +306,25 @@ class WeChatDBDecryptor:
                         f_out.write(page_buf)
                     break
 
+                # 检查页面是否全为零（复刻 Go 版本逻辑）
+                if page_buf == b'\x00' * self.page_size:
+                    # 全零页面直接写入，不需要解密
+                    f_out.write(page_buf)
+                    if progress_callback:
+                        progress_callback(page_num + 1, total_pages)
+                    continue
+
                 try:
                     # 解密页面
                     decrypted_page = self._decrypt_page(
                         page_buf, enc_key, mac_key, page_num
                     )
 
-                    # 第一页需要替换 SQLite 头部
+                    # 第一页需要替换 SQLite 头部并保持 4096 字节
+                    # 修复：_decrypt_page 对第 0 页返回 4080 字节（去掉了 salt）
+                    # 需要在前面补上 16 字节的 SQLite 头，使总大小为 4096 字节
                     if page_num == 0:
-                        decrypted_page = SQLITE_HEADER + decrypted_page[len(SQLITE_HEADER):]
+                        decrypted_page = SQLITE_HEADER + decrypted_page
 
                     # 写入解密数据
                     f_out.write(decrypted_page)
