@@ -12,6 +12,7 @@ from typing import Optional
 try:
     from decrypt_core import WeChatDBDecryptor, DecryptError, InvalidKeyError
     from image_decrypt import WeChatImageDecryptor, ImageDecryptError
+    from chat_export import WeChatChatExporter, ChatExportError
 except ImportError:
     print("错误: 无法导入解密模块，请确保在正确的目录下运行")
     print("或使用: python -m wechat_decrypt")
@@ -275,6 +276,69 @@ def info_cmd(args):
     return 0
 
 
+def export_cmd(args):
+    """导出聊天记录命令"""
+    print("=" * 70)
+    print("聊天记录导出")
+    print("=" * 70)
+
+    # 检查数据库文件
+    db_path = Path(args.input)
+    if not db_path.exists():
+        print(f"\n错误: 数据库文件不存在: {args.input}")
+        return 1
+
+    print(f"\n数据库文件: {db_path.absolute()}")
+    print(f"输出文件: {args.output}")
+
+    if args.info:
+        print(f"\n模式: 导出数据库结构信息")
+    else:
+        print(f"\n模式: 导出聊天记录")
+        print(f"消息表: {args.table}")
+        if args.limit:
+            print(f"限制: {args.limit} 条消息")
+        else:
+            print(f"限制: 无（导出全部）")
+
+    print()
+    print("开始导出...")
+    print("-" * 70)
+
+    try:
+        with WeChatChatExporter(args.input) as exporter:
+            if args.info:
+                # 导出数据库结构信息
+                exporter.export_database_info(args.output)
+                print("\n✓ 数据库结构信息导出成功！")
+            else:
+                # 导出聊天记录
+                exporter.export_to_markdown(
+                    args.output,
+                    table_name=args.table,
+                    limit=args.limit,
+                    title=args.title if args.title else "微信聊天记录"
+                )
+                print("\n✓ 聊天记录导出成功！")
+
+        print(f"\n输出文件: {Path(args.output).absolute()}")
+
+        # 显示输出文件大小
+        output_size = Path(args.output).stat().st_size
+        print(f"文件大小: {format_file_size(output_size)}")
+
+        return 0
+
+    except ChatExportError as e:
+        print(f"\n❌ 导出失败: {e}")
+        return 1
+    except Exception as e:
+        print(f"\n❌ 未知错误: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(
@@ -296,6 +360,12 @@ def main():
 
   # 显示文件信息
   %(prog)s info -i MSG0.db
+
+  # 导出聊天记录
+  %(prog)s export -i MSG0_decrypted.db -o chat.md
+
+  # 导出数据库结构
+  %(prog)s export -i MSG0_decrypted.db -o db_info.md --info
         """
     )
 
@@ -329,6 +399,15 @@ def main():
     info_parser = subparsers.add_parser('info', help='显示文件信息')
     info_parser.add_argument('-i', '--input', required=True, help='文件路径')
 
+    # 导出聊天记录命令
+    export_parser = subparsers.add_parser('export', help='导出聊天记录到 Markdown')
+    export_parser.add_argument('-i', '--input', required=True, help='解密后的数据库文件')
+    export_parser.add_argument('-o', '--output', required=True, help='输出的 Markdown 文件')
+    export_parser.add_argument('--table', default='MSG', help='消息表名（默认: MSG）')
+    export_parser.add_argument('--limit', type=int, help='限制导出的消息数量')
+    export_parser.add_argument('--title', help='Markdown 文档标题')
+    export_parser.add_argument('--info', action='store_true', help='导出数据库结构信息')
+
     # 解析参数
     args = parser.parse_args()
 
@@ -348,6 +427,8 @@ def main():
             return detect_xor_key_cmd(args)
         elif args.command == 'info':
             return info_cmd(args)
+        elif args.command == 'export':
+            return export_cmd(args)
         else:
             parser.print_help()
             return 1
