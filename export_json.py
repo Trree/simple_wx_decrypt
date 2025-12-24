@@ -42,6 +42,7 @@ class WeChatJSONExporter:
         self.decrypted_dir = Path(decrypted_dir)
         self.message_dbs: List[Path] = []
         self.db_connections: Dict[str, sqlite3.Connection] = {}
+        self.contact_cache: Dict[str, Dict[str, Any]] = {}  # 联系人信息缓存
 
     def __enter__(self):
         return self
@@ -271,6 +272,12 @@ class WeChatJSONExporter:
                         column_map['source'] = available_columns[possible_name.lower()]
                         break
 
+                # real_sender_id 列（可选，群聊消息的发送者）
+                for possible_name in ['real_sender_id', 'realSenderId', 'sender_id', 'senderId', 'sender']:
+                    if possible_name.lower() in available_columns:
+                        column_map['real_sender_id'] = available_columns[possible_name.lower()]
+                        break
+
                 # 构建 SELECT 语句
                 select_parts = []
                 if 'local_id' in column_map:
@@ -289,6 +296,8 @@ class WeChatJSONExporter:
                     select_parts.append(f"{column_map['compress_content']} as compress_content")
                 if 'source' in column_map:
                     select_parts.append(f"{column_map['source']} as source")
+                if 'real_sender_id' in column_map:
+                    select_parts.append(f"{column_map['real_sender_id']} as real_sender_id")
 
                 if not select_parts:
                     print(f"  ⚠ 表 {table_name} 没有可识别的列")
@@ -344,6 +353,10 @@ class WeChatJSONExporter:
         Returns:
             联系人信息字典
         """
+        # 检查缓存
+        if session_id in self.contact_cache:
+            return self.contact_cache[session_id]
+
         contact_info = {
             'wxid': session_id,
             'nickname': '',
@@ -383,6 +396,8 @@ class WeChatJSONExporter:
                             contact_info['remark'] = row['remark'] or ''
                             contact_info['alias'] = row['alias'] or ''
                             conn.close()
+                            # 缓存结果
+                            self.contact_cache[session_id] = contact_info
                             return contact_info
                     except:
                         continue
@@ -392,7 +407,25 @@ class WeChatJSONExporter:
                 print(f"  ⚠ 获取联系人信息失败: {e}")
                 continue
 
+        # 缓存结果（即使是空的）
+        self.contact_cache[session_id] = contact_info
         return contact_info
+
+    def get_sender_display_name(self, sender_wxid: str) -> str:
+        """
+        获取发送者的显示名称
+
+        Args:
+            sender_wxid: 发送者的微信ID
+
+        Returns:
+            显示名称（优先级：备注 > 昵称 > wxid）
+        """
+        if not sender_wxid:
+            return ''
+
+        contact = self.get_contact_info(sender_wxid)
+        return contact.get('remark') or contact.get('nickname') or sender_wxid
 
     def _parse_source_xml(self, source: str) -> Dict[str, Any]:
         """
@@ -439,7 +472,7 @@ class WeChatJSONExporter:
 
     def _safe_decode(self, data: Any, field_name: str = '') -> str:
         """
-        安全解码数据，处理 bytes、二进制等各种格式
+        安全解码数据，处理 bytes、二进制、压缩数据等各种格式
 
         Args:
             data: 要解码的数据
@@ -455,17 +488,50 @@ class WeChatJSONExporter:
             return data
 
         if isinstance(data, bytes):
-            # 尝试多种编码
+            # 步骤1：检查并尝试 Zstandard 解压缩
+            # Zstandard magic numbers: 0x28B52FFD (little-endian) 或 0xFD2FB528 (big-endian)
+            if len(data) >= 4:
+                magic = int.from_bytes(data[:4], 'little')
+                if magic == 0x28B52FFD or magic == 0xFD2FB528:
+                    try:
+                        import zstandard as zstd
+                        dctx = zstd.ZstdDecompressor()
+                        decompressed = dctx.decompress(data)
+                        # 解压成功，递归处理解压后的数据
+                        return self._safe_decode(decompressed, field_name)
+                    except ImportError:
+                        # 如果没有安装 zstandard 库，提示用户
+                        print("警告: 检测到 zstd 压缩数据，但未安装 zstandard 库")
+                        print("请运行: pip install zstandard")
+                    except Exception as e:
+                        # zstd 解压失败，继续尝试其他方式
+                        pass
+
+            # 步骤2：尝试 zlib 解压缩
+            # 压缩数据通常以特定字节开头，如 0x78 0x9C (默认压缩) 或 0x78 0xDA (最佳压缩)
+            try:
+                import zlib
+                decompressed = zlib.decompress(data)
+                # 解压成功，递归处理解压后的数据
+                return self._safe_decode(decompressed, field_name)
+            except:
+                # 解压失败，继续尝试直接解码
+                pass
+
+            # 步骤3：尝试多种编码直接解码
             for encoding in ['utf-8', 'gbk', 'gb2312', 'latin1']:
                 try:
                     decoded = data.decode(encoding, errors='ignore')
-                    # 检查是否为可打印字符
-                    if decoded and all(c.isprintable() or c in '\n\r\t' for c in decoded[:100]):
+                    # 检查是否为可打印字符（包含XML常见字符）
+                    if decoded and (
+                        decoded.startswith('<') or  # XML数据
+                        all(c.isprintable() or c in '\n\r\t' for c in decoded[:100])
+                    ):
                         return decoded
                 except:
                     continue
 
-            # 如果都失败，返回 base64 编码
+            # 步骤4：如果都失败，返回 base64 编码
             import base64
             return f"[二进制数据: {base64.b64encode(data[:100]).decode()}{'...' if len(data) > 100 else ''}]"
 
@@ -493,7 +559,19 @@ class WeChatJSONExporter:
             50: '通话消息',
             10000: '系统消息',
             10002: '撤回消息',
-            244813135921: '富文本/引用消息',  # 新版微信
+            244813135921: '引用消息',  # 新版微信
+            17179869233: '卡片式链接',
+            21474836529: '图文消息',
+            154618822705: '小程序分享',
+            12884901937: '音乐卡片',
+            8594229559345: '红包卡片',
+            81604378673: '聊天记录合并转发',
+            266287972401: '拍一拍消息',
+            8589934592049: '转账卡片',
+            270582939697: '视频号直播卡片',
+            25769803825: '文件消息',
+            34359738417: '文件消息',
+            103079215153: '文件消息',
         }
         return type_map.get(type_code, f'未知类型({type_code})')
 
@@ -547,41 +625,71 @@ class WeChatJSONExporter:
             formatted_messages = []
             for msg in messages:
                 # 安全解码各个字段
-                content = self._safe_decode(msg.get('content', ''), 'content')
+                raw_content = self._safe_decode(msg.get('content', ''), 'content')
                 source = self._safe_decode(msg.get('source', ''), 'source')
-                compress_content = self._safe_decode(msg.get('compress_content', ''), 'compress_content')
 
-                # 解析 source XML
-                source_parsed = None
-                if source and source.startswith('<'):
-                    source_parsed = self._parse_source_xml(source)
+                # 处理 content：对于引用消息（type 244813135921），从 XML 中提取 title
+                content = raw_content
+                msg_type = msg.get('type', 0)
 
-                # 对于引用消息，尝试从 source 中提取可读内容
-                display_content = content
-                if source_parsed and 'referMsg' in source_parsed:
-                    refer_info = source_parsed['referMsg']
-                    display_content = f"[引用消息] {refer_info.get('displayName', '未知')}: {refer_info.get('content', '')[:50]}"
-                    if content and content != display_content:
-                        display_content += f"\n回复: {content[:100]}"
+                # 检查是否为引用消息的 XML 格式
+                if msg_type == 244813135921 and raw_content:
+                    # 尝试从 XML 中提取 title
+                    if '<?xml' in raw_content or '<msg>' in raw_content:
+                        try:
+                            import xml.etree.ElementTree as ET
+                            # 移除可能的前缀（如 "SunnyUIBE:\n"）
+                            xml_start = raw_content.find('<?xml')
+                            if xml_start == -1:
+                                xml_start = raw_content.find('<msg>')
 
+                            if xml_start >= 0:
+                                xml_content = raw_content[xml_start:]
+                                root = ET.fromstring(xml_content)
+
+                                # 提取 title
+                                title_elem = root.find('.//title')
+                                if title_elem is not None and title_elem.text:
+                                    content = title_elem.text
+                        except:
+                            # XML 解析失败，保持原内容
+                            pass
+
+                # 获取发送者信息（群聊消息）
+                sender_id = msg.get('real_sender_id', '')
+                if isinstance(sender_id, bytes):
+                    sender_id = self._safe_decode(sender_id, 'real_sender_id')
+
+                # 清理空字符串为 None
+                if not sender_id or sender_id == '':
+                    sender_id = None
+
+                # 获取发送者显示名称
+                if sender_id:
+                    # 群聊消息：使用发送者的联系人信息
+                    sender_display_name = self.get_sender_display_name(sender_id)
+                else:
+                    # 私聊消息：使用会话联系人的显示名称
+                    sender_display_name = contact_info.get('remark') or contact_info.get('nickname') or contact_info['wxid']
+
+                # 构建消息对象（与 EchoTrace 格式一致）
                 formatted_msg = {
                     'localId': msg.get('local_id'),
                     'createTime': msg.get('create_time'),
                     'formattedTime': self.format_timestamp(msg.get('create_time', 0)),
-                    'type': self.format_message_type(msg.get('type', 0)),
-                    'typeCode': msg.get('type'),
-                    'isSend': msg.get('is_send', 0) == 1,
+                    'type': self.format_message_type(msg_type),
+                    'localType': msg_type,
                     'content': content,
-                    'displayContent': display_content,  # 用于显示的内容
-                    'source': source,
-                    'sourceParsed': source_parsed,  # 解析后的 source
-                    'compressContent': compress_content,
-                    'database': msg.get('database'),
-                    'table': msg.get('table')
+                    'isSend': msg.get('is_send', 0),
+                    'senderUsername': sender_id,  # 群聊消息的发送者 wxid，私聊为 None
+                    'senderDisplayName': sender_display_name,  # 发送者显示名称
+                    'senderAvatarKey': sender_id,  # 头像键，与 senderUsername 相同
+                    'source': source,  # 消息来源（XML格式）
                 }
+
                 formatted_messages.append(formatted_msg)
 
-            # 构建输出数据
+            # 构建输出数据（与 EchoTrace 格式一致）
             output_data = {
                 'session': {
                     'wxid': contact_info['wxid'],
@@ -589,11 +697,7 @@ class WeChatJSONExporter:
                     'remark': contact_info['remark'],
                     'alias': contact_info['alias'],
                     'displayName': contact_info['remark'] or contact_info['nickname'] or contact_info['wxid'],
-                },
-                'statistics': {
-                    'totalMessages': len(messages),
-                    'databases': list(set(msg.get('database') for msg in messages)),
-                    'tables': list(set(msg.get('table') for msg in messages)),
+                    'messageCount': len(messages),  # 添加消息数量到 session 中
                 },
                 'messages': formatted_messages,
                 'exportTime': datetime.now().isoformat(),
