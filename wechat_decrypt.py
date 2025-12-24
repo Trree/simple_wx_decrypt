@@ -12,6 +12,7 @@ from typing import Optional
 try:
     from decrypt_core import WeChatDBDecryptor, DecryptError, InvalidKeyError
     from image_decrypt import WeChatImageDecryptor, ImageDecryptError
+    from batch_decrypt import BatchDecryptor, format_size, format_duration
 except ImportError:
     print("错误: 无法导入解密模块，请确保在正确的目录下运行")
     print("或使用: python -m wechat_decrypt")
@@ -228,6 +229,132 @@ def validate_key_cmd(args):
         return 1
 
 
+def batch_decrypt_cmd(args):
+    """批量解密命令"""
+    from datetime import datetime
+
+    print("=" * 70)
+    print("批量数据库解密")
+    print("=" * 70)
+    print()
+
+    # 创建批量解密器
+    batch_decryptor = BatchDecryptor(args.key, args.skip_validation)
+
+    # 扫描数据库
+    print(f"正在扫描目录: {args.input}")
+    print("-" * 70)
+
+    try:
+        db_files = batch_decryptor.scan_databases(args.input)
+    except Exception as e:
+        print(f"❌ 扫描失败: {e}")
+        return 1
+
+    if not db_files:
+        print("未找到任何 .db 文件")
+        return 1
+
+    print(f"✓ 找到 {len(db_files)} 个数据库文件:\n")
+
+    total_size = 0
+    for idx, db_file in enumerate(db_files, 1):
+        print(f"  {idx:3d}. {db_file.relative_path}")
+        print(f"       大小: {format_size(db_file.file_size)}")
+        total_size += db_file.file_size
+
+    print()
+    print(f"总大小: {format_size(total_size)}")
+    print()
+
+    if args.scan_only:
+        print("仅扫描模式，退出")
+        return 0
+
+    # 开始解密
+    print("=" * 70)
+    print("开始批量解密")
+    print("=" * 70)
+    print(f"输出目录: {args.output}")
+    print(f"模式: {'并行 (' + str(args.parallel) + '线程)' if args.parallel > 0 else '顺序'}")
+    if args.skip_validation:
+        print("⚠️  已跳过密钥验证")
+    print()
+
+    start_time = datetime.now()
+
+    try:
+        if args.parallel > 0:
+            # 并行解密
+            def progress_callback(filename, current, total, total_files):
+                percent = (current / total) * 100
+                print(f"\r进度: [{current}/{total}] {percent:.1f}% | 当前: {filename[:40]:<40}", end='', flush=True)
+
+            success_results, failed_results = batch_decryptor.decrypt_batch(
+                args.input,
+                args.output,
+                max_workers=args.parallel,
+                progress_callback=progress_callback
+            )
+        else:
+            # 顺序解密
+            def file_progress(current, total):
+                percent = (current / total) * 100
+                bar_length = 40
+                filled = int(bar_length * current / total)
+                bar = '█' * filled + '░' * (bar_length - filled)
+                print(f"\r  [{bar}] {percent:.1f}%", end='', flush=True)
+
+            def overall_progress(filename, current, total):
+                print(f"\n[{current}/{total}] {filename}")
+
+            success_results, failed_results = batch_decryptor.decrypt_batch_sequential(
+                args.input,
+                args.output,
+                file_progress_callback=file_progress if not args.quiet else None,
+                overall_progress_callback=overall_progress if not args.quiet else None
+            )
+
+        print("\n")
+    except Exception as e:
+        print(f"\n❌ 批量解密失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+    # 显示结果
+    duration = (datetime.now() - start_time).total_seconds()
+
+    print("=" * 70)
+    print("解密完成")
+    print("=" * 70)
+    print()
+    print(f"总耗时: {format_duration(duration)}")
+    print(f"成功: {len(success_results)} 个")
+    print(f"失败: {len(failed_results)} 个")
+    print()
+
+    if success_results:
+        print("✓ 成功:")
+        total_success_size = 0
+        for result in success_results:
+            print(f"  ✓ {result.db_file.relative_path}")
+            if not args.quiet:
+                print(f"    耗时: {result.duration:.1f}秒 | 输出: {result.output_path.name}")
+            total_success_size += result.db_file.file_size
+        print(f"  总大小: {format_size(total_success_size)}")
+        print()
+
+    if failed_results:
+        print("✗ 失败:")
+        for result in failed_results:
+            print(f"  ✗ {result.db_file.relative_path}")
+            print(f"    错误: {result.error}")
+        print()
+
+    return 0 if not failed_results else 1
+
+
 def info_cmd(args):
     """显示文件信息命令"""
     print("=" * 70)
@@ -282,8 +409,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 解密数据库
+  # 解密单个数据库
   %(prog)s db -i MSG0.db -o MSG0_decrypted.db -k 0123456789abcdef...
+
+  # 批量解密目录（保持结构）
+  %(prog)s batch -i "C:/WeChat Files/wxid_xxx" -o ./output -k 0123456789abcdef...
+
+  # 批量解密（并行4线程）
+  %(prog)s batch -i ./input -o ./output -k 0123456789abcdef... --parallel 4
 
   # 验证密钥
   %(prog)s validate -i MSG0.db -k 0123456789abcdef...
@@ -329,6 +462,16 @@ def main():
     info_parser = subparsers.add_parser('info', help='显示文件信息')
     info_parser.add_argument('-i', '--input', required=True, help='文件路径')
 
+    # 批量解密命令
+    batch_parser = subparsers.add_parser('batch', help='批量解密目录')
+    batch_parser.add_argument('-i', '--input', required=True, help='输入根目录')
+    batch_parser.add_argument('-o', '--output', required=True, help='输出根目录')
+    batch_parser.add_argument('-k', '--key', required=True, help='64 位十六进制密钥')
+    batch_parser.add_argument('--parallel', type=int, default=0, help='并行线程数（0=顺序，默认0）')
+    batch_parser.add_argument('--skip-validation', action='store_true', help='跳过密钥验证')
+    batch_parser.add_argument('--scan-only', action='store_true', help='仅扫描，不解密')
+    batch_parser.add_argument('-q', '--quiet', action='store_true', help='安静模式（减少输出）')
+
     # 解析参数
     args = parser.parse_args()
 
@@ -348,6 +491,8 @@ def main():
             return detect_xor_key_cmd(args)
         elif args.command == 'info':
             return info_cmd(args)
+        elif args.command == 'batch':
+            return batch_decrypt_cmd(args)
         else:
             parser.print_help()
             return 1
