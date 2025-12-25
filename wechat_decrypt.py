@@ -14,6 +14,7 @@ try:
     from image_decrypt import WeChatImageDecryptor, ImageDecryptError
     from batch_decrypt import BatchDecryptor, format_size, format_duration
     from export_json import WeChatJSONExporter, MessageTableNotFoundError
+    from export_markdown import WeChatMarkdownExporter
 except ImportError:
     print("错误: 无法导入解密模块，请确保在正确的目录下运行")
     print("或使用: python -m wechat_decrypt")
@@ -403,19 +404,21 @@ def info_cmd(args):
     return 0
 
 
-def export_json_cmd(args):
-    """导出JSON命令"""
+def export_cmd(args):
+    """导出消息命令 (支持 JSON 和 Markdown)"""
+    format_type = getattr(args, 'format', 'json')  # 默认 JSON 格式
+
     print("=" * 70)
-    print("导出微信消息为 JSON")
+    print(f"导出微信消息为 {format_type.upper()}")
     print("=" * 70)
 
     try:
-        with WeChatJSONExporter(args.dir) as exporter:
-            # 发现数据库
-            exporter.discover_message_databases()
+        # 列出会话（格式无关）
+        if args.list:
+            with WeChatJSONExporter(args.dir) as exporter:
+                # 发现数据库
+                exporter.discover_message_databases()
 
-            # 列出会话
-            if args.list:
                 print("\n所有会话:")
                 print("=" * 70)
 
@@ -439,8 +442,14 @@ def export_json_cmd(args):
                     print("\n提示: 使用不带 --quick 参数可以统计消息数量（较慢）")
                 return 0
 
-            # 导出会话
-            if args.session:
+        # 导出会话
+        if not args.session:
+            print("\n请使用 --session 指定会话ID，或使用 --list 查看所有会话")
+            return 1
+
+        # 根据格式选择导出器
+        if format_type == 'json':
+            with WeChatJSONExporter(args.dir) as exporter:
                 output = args.output or f"{args.session}_chat_history.json"
                 success = exporter.export_session_to_json(
                     args.session,
@@ -448,9 +457,19 @@ def export_json_cmd(args):
                     limit=args.limit
                 )
                 return 0 if success else 1
-            else:
-                print("\n请使用 --session 指定会话ID，或使用 --list 查看所有会话")
-                return 1
+
+        elif format_type == 'markdown':
+            with WeChatMarkdownExporter(args.dir) as exporter:
+                output = args.output or f"{args.session}_chat_history.md"
+                success = exporter.export_session_to_markdown(
+                    args.session,
+                    output,
+                    limit=args.limit
+                )
+                return 0 if success else 1
+        else:
+            print(f"\n错误: 不支持的格式 '{format_type}'")
+            return 1
 
     except MessageTableNotFoundError as e:
         print(f"\n错误: {e}")
@@ -478,8 +497,11 @@ def main():
   # 批量解密（并行4线程）
   %(prog)s batch -i ./input -o ./output -k 0123456789abcdef... --parallel 4
 
-  # 导出会话为JSON（支持分表）
+  # 导出会话为 JSON（支持分表）
   %(prog)s export -d ./decrypted_dir -s wxid_xxx -o chat.json
+
+  # 导出会话为 Markdown（简洁聊天记录格式）
+  %(prog)s export -d ./decrypted_dir -s wxid_xxx -o chat.md --format markdown
 
   # 列出所有会话
   %(prog)s export -d ./decrypted_dir --list
@@ -538,12 +560,13 @@ def main():
     batch_parser.add_argument('--scan-only', action='store_true', help='仅扫描，不解密')
     batch_parser.add_argument('-q', '--quiet', action='store_true', help='安静模式（减少输出）')
 
-    # 导出JSON命令
-    export_parser = subparsers.add_parser('export', help='导出消息为JSON（支持分表）')
+    # 导出命令 (支持 JSON 和 Markdown)
+    export_parser = subparsers.add_parser('export', help='导出消息 (支持 JSON 和 Markdown)')
     export_parser.add_argument('-d', '--dir', required=True, help='解密后的微信账号目录')
     export_parser.add_argument('-s', '--session', help='会话ID (微信ID)')
-    export_parser.add_argument('-o', '--output', help='输出JSON文件路径')
+    export_parser.add_argument('-o', '--output', help='输出文件路径')
     export_parser.add_argument('-l', '--limit', type=int, help='限制消息数量')
+    export_parser.add_argument('-f', '--format', choices=['json', 'markdown'], default='json', help='导出格式 (默认: json)')
     export_parser.add_argument('--list', action='store_true', help='列出所有会话')
     export_parser.add_argument('--quick', action='store_true', help='快速模式，不统计消息数量')
 
@@ -569,7 +592,7 @@ def main():
         elif args.command == 'batch':
             return batch_decrypt_cmd(args)
         elif args.command == 'export':
-            return export_json_cmd(args)
+            return export_cmd(args)
         else:
             parser.print_help()
             return 1
